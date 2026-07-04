@@ -90,6 +90,175 @@ _DIRECT_IO_ALIGNMENT = 4096
 _DIRECT_IO_PADDING_BYTES = 2 * _DIRECT_IO_ALIGNMENT
 
 
+class _BlockStager:
+    """Gather/scatter one block's per-layer KV pages through a contiguous,
+    pre-registered GPU staging pool so each Mooncake key transfers as a
+    single large buffer.
+
+    GLM-5.2 / DeepSeek DSA sparse-MLA and indexer kernels require per-layer
+    contiguous (layer-major) KV tensors, so one block's bytes are physically
+    scattered across ``num_regions`` per-layer regions (99 tiny SG entries
+    per 64-token block for GLM-5.2). Staging trades one on-device batched
+    copy for a single ``sum(block_lens)``-byte wire buffer per key. The
+    stored value is the exact concatenation the multi-buffer path produces,
+    so coalesced and non-coalesced peers remain wire-compatible.
+    """
+
+    def __init__(
+        self,
+        store: Any,
+        region_caches: list[torch.Tensor],
+        block_lens: list[int],
+        num_blocks: int,
+        num_slots: int,
+    ):
+        assert len(region_caches) == len(block_lens) > 0
+        self.block_lens = list(block_lens)
+        self.num_regions = len(block_lens)
+        self.slot_bytes = sum(block_lens)
+        self.num_slots = num_slots
+        device = region_caches[0].device
+        # (num_blocks, block_len) uint8 view over each per-layer region.
+        self.region_views = [
+            cache.reshape(-1).view(torch.uint8).view(num_blocks, blk_len)
+            for cache, blk_len in zip(region_caches, block_lens, strict=True)
+        ]
+        self.offsets: list[int] = []
+        off = 0
+        for blk_len in block_lens:
+            self.offsets.append(off)
+            off += blk_len
+        self.staging = torch.zeros(
+            num_slots, self.slot_bytes, dtype=torch.uint8, device=device
+        )
+        self.slot_addrs = [
+            self.staging.data_ptr() + i * self.slot_bytes for i in range(num_slots)
+        ]
+        ret = store.register_buffer(self.staging.data_ptr(), self.staging.nbytes)
+        if ret != 0:
+            raise RuntimeError(f"register_buffer(staging) failed: {ret}")
+        self.stream = torch.cuda.Stream(device=device)
+
+    def matches(self, sizes: list[list[int]]) -> bool:
+        """True iff every key is exactly one whole block across all regions."""
+        return all(sz == self.block_lens for sz in sizes)
+
+    def _copy_pairs(self, dsts: list[torch.Tensor], srcs: list[torch.Tensor]):
+        # Runs on a private stream; callers are already CPU-synchronized
+        # with the producers of src (save: current_event.synchronize();
+        # load: batch_get_into returned). Synchronize before returning so
+        # RDMA reads / later model kernels observe the copies.
+        with torch.cuda.stream(self.stream):
+            try:
+                torch._foreach_copy_(dsts, srcs)
+            except (AttributeError, RuntimeError):
+                for dst, src in zip(dsts, srcs, strict=True):
+                    dst.copy_(src, non_blocking=True)
+        self.stream.synchronize()
+
+    def _slot_slices(self, slot: int) -> list[torch.Tensor]:
+        row = self.staging[slot]
+        return [
+            row[off : off + blk_len]
+            for off, blk_len in zip(self.offsets, self.block_lens, strict=True)
+        ]
+
+    def put_coalesced(
+        self,
+        store: Any,
+        keys: list[str],
+        block_ids: list[int],
+        replicate_config: Any,
+    ) -> list[int]:
+        res: list[int] = []
+        for i in range(0, len(keys), self.num_slots):
+            chunk_keys = keys[i : i + self.num_slots]
+            chunk_blocks = block_ids[i : i + self.num_slots]
+            dsts: list[torch.Tensor] = []
+            srcs: list[torch.Tensor] = []
+            for slot, block_id in enumerate(chunk_blocks):
+                dsts.extend(self._slot_slices(slot))
+                srcs.extend(view[block_id] for view in self.region_views)
+            self._copy_pairs(dsts, srcs)
+            res.extend(
+                store.batch_put_from_multi_buffers(
+                    chunk_keys,
+                    [[self.slot_addrs[j]] for j in range(len(chunk_keys))],
+                    [[self.slot_bytes]] * len(chunk_keys),
+                    replicate_config,
+                )
+            )
+        return res
+
+    def get_coalesced(
+        self, store: Any, keys: list[str], block_ids: list[int]
+    ) -> list[int]:
+        res: list[int] = []
+        for i in range(0, len(keys), self.num_slots):
+            chunk_keys = keys[i : i + self.num_slots]
+            chunk_blocks = block_ids[i : i + self.num_slots]
+            chunk_res = store.batch_get_into_multi_buffers(
+                chunk_keys,
+                [[self.slot_addrs[j]] for j in range(len(chunk_keys))],
+                [[self.slot_bytes]] * len(chunk_keys),
+            )
+            dsts: list[torch.Tensor] = []
+            srcs: list[torch.Tensor] = []
+            for slot, (block_id, code) in enumerate(
+                zip(chunk_blocks, chunk_res, strict=True)
+            ):
+                if code < 0:
+                    continue  # failed key: never scatter stale staging bytes
+                dsts.extend(view[block_id] for view in self.region_views)
+                srcs.extend(self._slot_slices(slot))
+            if dsts:
+                self._copy_pairs(dsts, srcs)
+            res.extend(chunk_res)
+        return res
+
+
+def _detect_kv_layout(
+    cache: torch.Tensor, base_addr: int, region_len: int, num_blocks: int
+) -> tuple[list[int], list[int], torch.Tensor | None]:
+    """Classify one KV region's memory layout for Mooncake registration.
+
+    Returns ``(addrs, block_lens, coalesce_region)``:
+      * ``addrs`` / ``block_lens`` are the per-segment base addresses and
+        per-block byte lengths to register (one entry for blocks-first
+        layouts, N for K/V-first layouts split along the outer dim).
+      * ``coalesce_region`` is the tensor to feed the per-block stager when
+        the region is blocks-first *and* densely contiguous, else ``None``
+        (signalling this region cannot participate in coalescing).
+
+    Layout is detected via stride: a dim whose byte-stride exceeds one
+    block's size is an outer segment dim (e.g. FlashAttn's ``(2, num_blocks,
+    ...)`` K/V dim). FlashInfer/MLA's blocks-outermost layout has no such dim
+    and yields a single segment.
+    """
+    el = cache.element_size()
+    page_size_bytes = region_len // num_blocks
+    outer_dims = [
+        d for d in range(cache.ndim) if cache.stride(d) * el > page_size_bytes
+    ]
+    if not outer_dims:
+        # Blocks-first layout (FlashInfer / MLA): one segment.
+        coalesce_region = (
+            cache
+            if (
+                cache.is_contiguous()
+                and cache.numel() * el == region_len
+                and region_len % num_blocks == 0
+            )
+            else None
+        )
+        return [base_addr], [page_size_bytes], coalesce_region
+    # K/V-first layout (FlashAttn / ROCm): split segments; not coalescable.
+    seg_stride = cache.stride(outer_dims[0]) * el
+    addrs = [base_addr + idx * seg_stride for idx in range(cache.shape[outer_dims[0]])]
+    block_lens = [seg_stride // num_blocks] * cache.shape[outer_dims[0]]
+    return addrs, block_lens, None
+
+
 MooncakeMode = Literal["embedded", "standalone-store"]
 
 
@@ -632,6 +801,7 @@ class KVCacheStoreSendingThread(KVTransferThread):
 
             addrs: list[list[int]] = []
             sizes: list[list[int]] = []
+            key_block_ids: list[int] = []
             stored_events: list[BlockStored] = []
             # parent_block_hash chains live within a group, not across.
             if self.enable_kv_event:
@@ -644,9 +814,10 @@ class KVCacheStoreSendingThread(KVTransferThread):
                 zip(starts, ends, group_indices, strict=True)
             ):
                 db = self.token_databases[g_idx]
-                addr, size, _ = db.prepare_value(s, e, block_ids_per_group[g_idx])
+                addr, size, blk_id = db.prepare_value(s, e, block_ids_per_group[g_idx])
                 addrs.append(addr)
                 sizes.append(size)
+                key_block_ids.append(blk_id)
 
                 if self.enable_kv_event:
                     token_ids = (
@@ -673,12 +844,18 @@ class KVCacheStoreSendingThread(KVTransferThread):
             batch_bytes = _sum_batch_bytes(sizes)
             put_start = time.perf_counter()
             try:
-                res = self.store.batch_put_from_multi_buffers(
-                    keys,
-                    addrs,
-                    sizes,
-                    self.replicate_config,
-                )
+                stager = getattr(self, "stager", None)
+                if stager is not None and stager.matches(sizes):
+                    res = stager.put_coalesced(
+                        self.store, keys, key_block_ids, self.replicate_config
+                    )
+                else:
+                    res = self.store.batch_put_from_multi_buffers(
+                        keys,
+                        addrs,
+                        sizes,
+                        self.replicate_config,
+                    )
                 failed = [i for i, v in enumerate(res) if v < 0]
                 self._record_operation(
                     "save_put",
@@ -884,9 +1061,15 @@ class KVCacheStoreRecvingThread(KVTransferThread):
                     tiers_by_key = _get_replica_tiers_by_key(self.store, batch_keys)
                 # Reset so the recorded RPC duration excludes tier lookup.
                 load_get_start = time.perf_counter()
-                res = self.store.batch_get_into_multi_buffers(
-                    batch_keys, batch_addrs, batch_sizes
-                )
+                stager = getattr(self, "stager", None)
+                if stager is not None and stager.matches(batch_sizes):
+                    res = stager.get_coalesced(
+                        self.store, batch_keys, batch_block_ids
+                    )
+                else:
+                    res = self.store.batch_get_into_multi_buffers(
+                        batch_keys, batch_addrs, batch_sizes
+                    )
                 if tiers_by_key is not None:
                     _log_mooncake_load_tier_summary(
                         req_id, batch_keys, res, tiers_by_key
@@ -1224,6 +1407,8 @@ class MooncakeStoreWorker:
         seen_ptrs: set[int] = set()
         addrs: list[int] = []
         block_lens: list[int] = []
+        region_caches: list[torch.Tensor] = []
+        coalesce_ok = True
 
         for value in kv_caches.values():
             cache = _repr_tensor(value)
@@ -1243,25 +1428,15 @@ class MooncakeStoreWorker:
                     ret,
                 )
 
-            # Detect layout via stride: a dim whose byte-stride exceeds
-            # page_size_bytes is an outer segment dim (e.g. the K/V dim of
-            # FlashAttn's (2, num_blocks, ...)). FlashInfer/MLA's blocks-
-            # outermost layout has no such dim and yields a single segment.
-            el = cache.element_size()
-            page_size_bytes = region_len // self.num_blocks
-            outer_dims = [
-                d for d in range(cache.ndim) if cache.stride(d) * el > page_size_bytes
-            ]
-            if not outer_dims:
-                # Blocks-first layout (FlashInfer / MLA): one segment.
-                addrs.append(base_addr)
-                block_lens.append(page_size_bytes)
+            seg_addrs, seg_lens, coalesce_region = _detect_kv_layout(
+                cache, base_addr, region_len, self.num_blocks
+            )
+            addrs.extend(seg_addrs)
+            block_lens.extend(seg_lens)
+            if coalesce_region is not None and len(seg_addrs) == 1:
+                region_caches.append(coalesce_region)
             else:
-                # K/V-first layout (FlashAttn / ROCm): split segments.
-                seg_stride = cache.stride(outer_dims[0]) * el
-                for idx in range(cache.shape[outer_dims[0]]):
-                    addrs.append(base_addr + idx * seg_stride)
-                    block_lens.append(seg_stride // self.num_blocks)
+                coalesce_ok = False
 
         logger.info(
             "Registered KV caches: num_groups=%d, num_segments=%d, num_blocks=%d",
@@ -1273,6 +1448,54 @@ class MooncakeStoreWorker:
         for db in self.token_dbs:
             db.set_kv_caches_base_addr(addrs)
             db.set_block_len(block_lens)
+
+        # Per-block coalescing: DSA kernels force per-layer KV regions, so
+        # one block's bytes span len(addrs) small segments (99 for GLM-5.2:
+        # 78 MLA + 21 indexer). Gather/scatter through a pre-registered
+        # contiguous staging pool so each key transfers as ONE large buffer.
+        send_stager = None
+        recv_stagers: list[_BlockStager] = []
+        coalesce_slots = envs.VLLM_MOONCAKE_COALESCE_SLOTS
+        if (
+            coalesce_ok
+            and coalesce_slots > 0
+            and len(addrs) > 1
+            and len(region_caches) == len(addrs)
+            and region_caches[0].device.type == "cuda"
+        ):
+            try:
+                if self.kv_role in ["kv_producer", "kv_both"]:
+                    send_stager = _BlockStager(
+                        self.store,
+                        region_caches,
+                        block_lens,
+                        self.num_blocks,
+                        coalesce_slots,
+                    )
+                recv_stagers = [
+                    _BlockStager(
+                        self.store,
+                        region_caches,
+                        block_lens,
+                        self.num_blocks,
+                        coalesce_slots,
+                    )
+                    for _ in range(self.num_recv_threads)
+                ]
+                logger.info(
+                    "Mooncake per-block coalescing ON: %d segments -> 1 "
+                    "buffer of %d bytes per block (%d staging slots/thread)",
+                    len(addrs),
+                    sum(block_lens),
+                    coalesce_slots,
+                )
+            except Exception:
+                logger.exception(
+                    "Per-block coalescing disabled (staging setup failed); "
+                    "falling back to per-layer multi-buffer transfers"
+                )
+                send_stager = None
+                recv_stagers = []
 
         # Start transfer threads
         if self.kv_role in ["kv_producer", "kv_both"]:
@@ -1290,6 +1513,7 @@ class MooncakeStoreWorker:
                 self.store_replicate_config,
                 record_operation=self._record_kv_connector_operation,
             )
+            self.kv_send_thread.stager = send_stager
             self.kv_send_thread.start()
 
         self.kv_recv_threads = []
@@ -1308,6 +1532,7 @@ class MooncakeStoreWorker:
                 request_queue=self.recv_request_queue,
             )
             recv_thread.name = f"KVCacheStoreRecvingThread-{i}"
+            recv_thread.stager = recv_stagers[i] if recv_stagers else None
             recv_thread.start()
             self.kv_recv_threads.append(recv_thread)
             ready_events_recving.append(ready_event_recving)

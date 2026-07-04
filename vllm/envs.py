@@ -203,6 +203,7 @@ if TYPE_CHECKING:
     VLLM_MOONCAKE_BOOTSTRAP_PORT: int = 8998
     VLLM_MOONCAKE_STORE_TIER_LOG: bool = False
     VLLM_MOONCAKE_LOAD_RECV_THREADS: int = 1
+    VLLM_MOONCAKE_COALESCE_SLOTS: int = 32
     VLLM_MOONCAKE_DISK_STAGING_USABLE_RATIO: float = 0.9
     MOONCAKE_PREFERRED_SEGMENT: str | None = None
     MOONCAKE_REQUESTER_LOCAL_HOSTNAME: str | None = None
@@ -1555,6 +1556,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # per-request batches are too small to saturate the link on their own.
     "VLLM_MOONCAKE_LOAD_RECV_THREADS": lambda: int(
         os.getenv("VLLM_MOONCAKE_LOAD_RECV_THREADS", "1")
+    ),
+    # Per-block KV coalescing (Mooncake store): number of pre-registered staging
+    # slots per transfer thread used to gather a block's per-layer KV regions into
+    # a single large buffer before transfer. 0 disables (per-layer multi-buffer
+    # transfers). Only takes effect for blocks-first-contiguous KV layouts.
+    "VLLM_MOONCAKE_COALESCE_SLOTS": lambda: int(
+        os.getenv("VLLM_MOONCAKE_COALESCE_SLOTS", "32")
     ),
     # Fraction of the owner's DirectIO staging buffer to fill per GET batch.
     "VLLM_MOONCAKE_DISK_STAGING_USABLE_RATIO": lambda: float(
