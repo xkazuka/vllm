@@ -971,6 +971,12 @@ class Worker(WorkerBase):
         if not self.profiler:
             return nullcontext()
 
+        # Skip empty bookkeeping iterations (0 scheduled tokens — frequent on
+        # a P/D prefill engine between turns): they would consume the
+        # warmup/active schedule while recording no kernels.
+        if getattr(scheduler_output, "total_num_scheduled_tokens", 0) == 0:
+            return nullcontext()
+
         self.profiler.step()
 
         iteration_details = compute_iteration_details(scheduler_output)
@@ -1144,6 +1150,10 @@ class Worker(WorkerBase):
                 logger.warning("Profiler was not started, nothing to stop.")
                 return
             self.profiler.stop()
+            # Discard the wrapper so the next start_profile builds a fresh
+            # torch profiler: the schedule is created with repeat=1, so a
+            # reused profiler records nothing after its first cycle.
+            self.profiler = None
 
     def execute_dummy_batch(self) -> None:
         num_tokens = getattr(self.model_runner, "uniform_decode_query_len", 1)
