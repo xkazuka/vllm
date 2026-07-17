@@ -4,6 +4,8 @@
 import functools
 import gc
 import itertools
+import os
+import re
 import threading
 import time
 from collections import defaultdict
@@ -6942,7 +6944,10 @@ class GPUModelRunner(
                 full_cls_name = attn_backend.full_cls_name()
                 layer_kv_cache_spec = kv_cache_group_spec.kv_cache_spec
                 if isinstance(layer_kv_cache_spec, UniformTypeKVCacheSpecs):
-                    layer_kv_cache_spec = layer_kv_cache_spec.kv_cache_specs[layer_name]
+                    # Cross-layer KV sharing: a shared layer has no entry of
+                    # its own; resolve to its target layer's spec.
+                    spec_key = self.shared_kv_cache_layers.get(layer_name, layer_name)
+                    layer_kv_cache_spec = layer_kv_cache_spec.kv_cache_specs[spec_key]
                 # Non-Attention layer types (e.g. Mamba1, ShortConv) do not
                 # expose ``num_heads``; fall back to 0 so they cluster as
                 # before. Such layers never coexist with Attention in a
@@ -7696,6 +7701,35 @@ class GPUModelRunner(
                         indexes = backend.indexes_kv_by_block_stride()
                     spec = replace(spec, indexes_kv_by_block_stride=indexes)
                 kv_cache_spec[layer_name] = spec
+
+        if os.environ.get("VLLM_SHARE_KV_ALL_LAYERS") == "1" and kv_cache_spec:
+            # TIMING EXPERIMENT ONLY: every layer aliases the KV cache of the
+            # lowest-indexed layer with an identical spec (per cache family,
+            # e.g. MLA latent vs DSA indexer). Capacity scales ~x num_layers;
+            # per-layer attention cost is unchanged; outputs are garbage.
+            def _family(name: str) -> str:
+                return re.sub(r"\.layers\.\d+\.", ".layers.*.", name)
+
+            def _layer_idx(name: str) -> int:
+                m = re.search(r"\.layers\.(\d+)\.", name)
+                return int(m.group(1)) if m else -1
+
+            family_target: dict[str, str] = {}
+            for name in sorted(kv_cache_spec, key=_layer_idx):
+                target = family_target.setdefault(_family(name), name)
+                if target != name:
+                    assert kv_cache_spec[name] == kv_cache_spec[target], (
+                        f"KV spec mismatch: {name} vs {target}"
+                    )
+                    self.shared_kv_cache_layers[name] = target
+            for name in self.shared_kv_cache_layers:
+                kv_cache_spec.pop(name, None)
+            logger.warning(
+                "VLLM_SHARE_KV_ALL_LAYERS=1: %d layers alias the KV caches of "
+                "%s. Outputs are garbage (timing experiment).",
+                len(self.shared_kv_cache_layers),
+                sorted(family_target.values()),
+            )
 
         return kv_cache_spec
 
