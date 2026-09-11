@@ -1006,8 +1006,9 @@ class Worker(WorkerBase):
 
         # Skip empty bookkeeping iterations (0 scheduled tokens — frequent on
         # a P/D prefill engine between turns): they would consume the
-        # warmup/active schedule while recording no kernels.
-        if getattr(scheduler_output, "total_num_scheduled_tokens", 0) == 0:
+        # warmup/active schedule while recording no kernels. A missing count
+        # (None) is not an empty iteration, so it still steps as upstream does.
+        if getattr(scheduler_output, "total_num_scheduled_tokens", None) == 0:
             return nullcontext()
 
         self.profiler.step()
