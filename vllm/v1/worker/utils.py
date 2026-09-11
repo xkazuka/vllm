@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import math
+import os
 from collections import defaultdict
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
@@ -554,6 +555,83 @@ def request_memory(init_snapshot: MemorySnapshot, cache_config: CacheConfig) -> 
         )
 
     return requested_memory
+
+
+def share_kv_all_layers_map(
+    kv_cache_spec: dict[str, KVCacheSpec],
+) -> dict[str, str]:
+    """Layer-wise KV transfer simulation (``VLLM_SHARE_KV_ALL_LAYERS=1``).
+
+    TIMING EXPERIMENT ONLY. Maps every layer onto the lowest-indexed layer in
+    its group, where a group is (module path with the layer index blanked,
+    KV cache spec). Only one layer per group allocates, so KV capacity scales
+    ~x num_layers while each layer's attention reads and writes keep their real
+    volume and access pattern.
+
+    This simulates ideal (zero-cost-transfer) layer-wise KV swapping: the upper
+    bound for any KV-capacity scheme, measured with real per-layer kernel
+    timings. Outputs are garbage by design.
+
+    Grouping on the spec as well as the path keeps mixed-window models working
+    (gpt-oss, gemma and friends interleave sliding-window and full attention):
+    each attention type aliases within itself instead of asserting. The path
+    key blanks only the outermost numeric segment, so naming differences
+    (``model.layers.N``, ``transformer.h.N``, ``...blocks.N``) all resolve, and
+    a second index (dual-attention models carry one per decoder layer) stays in
+    the key so those modules do not collapse into each other.
+
+    Returns:
+        Mapping of aliased layer name to the layer whose cache it reuses.
+        Empty when the env var is unset, so callers pay nothing by default.
+    """
+    if os.environ.get("VLLM_SHARE_KV_ALL_LAYERS") != "1" or not kv_cache_spec:
+        return {}
+
+    GroupKey = tuple[str, KVCacheSpec]
+    keyed: list[tuple[int, str, GroupKey]] = []
+    for layer_name, spec in kv_cache_spec.items():
+        parts = layer_name.split(".")
+        index = next((i for i, part in enumerate(parts) if part.isdigit()), None)
+        if index is None:
+            # No layer index in the name: nothing to alias it with.
+            continue
+        family = ".".join(parts[:index] + ["*"] + parts[index + 1 :])
+        keyed.append((int(parts[index]), layer_name, (family, spec)))
+
+    targets: dict[GroupKey, str] = {}
+    shared: dict[str, str] = {}
+    for _, layer_name, group_key in sorted(keyed, key=lambda item: item[:2]):
+        target = targets.setdefault(group_key, layer_name)
+        if target != layer_name:
+            shared[layer_name] = target
+
+    logger.warning(
+        "VLLM_SHARE_KV_ALL_LAYERS=1: %d of %d layers alias the KV caches of "
+        "%d layer(s): %s. Outputs are garbage (timing experiment).",
+        len(shared),
+        len(kv_cache_spec),
+        len(targets),
+        ", ".join(sorted(targets.values())),
+    )
+    return shared
+
+
+def resolve_kv_sharing_chains(shared_kv_cache_layers: dict[str, str]) -> dict[str, str]:
+    """Collapse KV-sharing chains so every layer points at an allocated layer.
+
+    A model's own KV sharing can target a layer that
+    ``share_kv_all_layers_map`` then aliases onto another one. Caches are
+    assigned in dict order, so an unresolved chain would read an entry that is
+    not populated yet. Self-maps and cycles terminate rather than raise.
+    """
+    resolved: dict[str, str] = {}
+    for layer_name, target in shared_kv_cache_layers.items():
+        seen = {layer_name}
+        while target in shared_kv_cache_layers and target not in seen:
+            seen.add(target)
+            target = shared_kv_cache_layers[target]
+        resolved[layer_name] = target
+    return resolved
 
 
 def add_kv_sharing_layers_to_kv_cache_groups(

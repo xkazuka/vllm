@@ -4,8 +4,6 @@
 import functools
 import gc
 import itertools
-import os
-import re
 import threading
 import time
 from collections import defaultdict
@@ -245,7 +243,9 @@ from .utils import (
     bind_kv_cache,
     copy_kv_cache_blocks_inplace,
     prepare_kernel_block_sizes,
+    resolve_kv_sharing_chains,
     sanity_check_mm_encoder_outputs,
+    share_kv_all_layers_map,
 )
 
 if TYPE_CHECKING:
@@ -7584,34 +7584,15 @@ class GPUModelRunner(
                     spec = attn_module.get_attn_backend().customize_spec(spec)
                 kv_cache_spec[layer_name] = spec
 
-        if os.environ.get("VLLM_SHARE_KV_ALL_LAYERS") == "1" and kv_cache_spec:
-            # TIMING EXPERIMENT ONLY: every layer aliases the KV cache of the
-            # lowest-indexed layer with an identical spec (per cache family,
-            # e.g. MLA latent vs DSA indexer). Capacity scales ~x num_layers;
-            # per-layer attention cost is unchanged; outputs are garbage.
-            def _family(name: str) -> str:
-                return re.sub(r"\.layers\.\d+\.", ".layers.*.", name)
-
-            def _layer_idx(name: str) -> int:
-                m = re.search(r"\.layers\.(\d+)\.", name)
-                return int(m.group(1)) if m else -1
-
-            family_target: dict[str, str] = {}
-            for name in sorted(kv_cache_spec, key=_layer_idx):
-                target = family_target.setdefault(_family(name), name)
-                if target != name:
-                    assert kv_cache_spec[name] == kv_cache_spec[target], (
-                        f"KV spec mismatch: {name} vs {target}"
-                    )
-                    self.shared_kv_cache_layers[name] = target
-            for name in self.shared_kv_cache_layers:
-                kv_cache_spec.pop(name, None)
-            logger.warning(
-                "VLLM_SHARE_KV_ALL_LAYERS=1: %d layers alias the KV caches of "
-                "%s. Outputs are garbage (timing experiment).",
-                len(self.shared_kv_cache_layers),
-                sorted(family_target.values()),
+        if share_all := share_kv_all_layers_map(kv_cache_spec):
+            # Timing experiment: only the target layers allocate, and every
+            # aliased layer reads and writes their caches instead.
+            self.shared_kv_cache_layers.update(share_all)
+            self.shared_kv_cache_layers.update(
+                resolve_kv_sharing_chains(self.shared_kv_cache_layers)
             )
+            for layer_name in share_all:
+                kv_cache_spec.pop(layer_name, None)
 
         return kv_cache_spec
 

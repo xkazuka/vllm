@@ -1,13 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-import os
 from collections.abc import Mapping, Sequence
 from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, cast
 
 import numpy as np
-import regex as re
 import torch
 
 from vllm.config import VllmConfig, get_layers_from_vllm_config
@@ -35,6 +33,8 @@ from vllm.v1.worker.utils import (
     allocate_kv_cache,
     bind_kv_cache,
     prepare_kernel_block_sizes,
+    resolve_kv_sharing_chains,
+    share_kv_all_layers_map,
 )
 
 if TYPE_CHECKING:
@@ -149,69 +149,8 @@ def get_kv_cache_spec(vllm_config: VllmConfig) -> dict[str, KVCacheSpec]:
 
 
 def _share_kv_all_layers_map(vllm_config: VllmConfig) -> dict[str, str]:
-    """Layer-wise KV transfer simulation (VLLM_SHARE_KV_ALL_LAYERS=1).
-
-    TIMING EXPERIMENT ONLY. Maps every layer onto the lowest-indexed layer
-    with an identical spec, per cache family (e.g. MLA latent vs DSA indexer
-    k-cache). Only the target layers' caches are allocated, so KV capacity
-    scales ~x num_layers while each layer's attention reads/writes keep their
-    real volume and access pattern.
-
-    This simulates ideal (zero-cost-transfer) layer-wise KV swapping: the
-    upper bound for any KV-capacity scheme, measured with real per-layer
-    kernel timings. Outputs are garbage by design.
-    """
-    if os.environ.get("VLLM_SHARE_KV_ALL_LAYERS") != "1":
-        return {}
-
-    specs = _collect_kv_cache_spec(vllm_config)
-    if not specs:
-        return {}
-
-    def _family(name: str) -> str:
-        return re.sub(r"\.layers\.\d+\.", ".layers.*.", name)
-
-    def _layer_idx(name: str) -> int:
-        m = re.search(r"\.layers\.(\d+)\.", name)
-        return int(m.group(1)) if m else -1
-
-    family_target: dict[str, str] = {}
-    shared: dict[str, str] = {}
-    for name in sorted(specs, key=_layer_idx):
-        target = family_target.setdefault(_family(name), name)
-        if target != name:
-            assert specs[name] == specs[target], f"KV spec mismatch: {name} vs {target}"
-            shared[name] = target
-    logger.warning_once(
-        "VLLM_SHARE_KV_ALL_LAYERS=1: %d layers alias the KV caches of %s. "
-        "Outputs are garbage (timing experiment).",
-        len(shared),
-        # warning_once hashes its args to dedupe, so pass a str, not a list.
-        ", ".join(sorted(family_target.values())),
-    )
-    return shared
-
-
-def _merge_share_all_layers(
-    native: dict[str, str], share_all: dict[str, str]
-) -> dict[str, str]:
-    """Merge the VLLM_SHARE_KV_ALL_LAYERS map over a model's own KV sharing,
-    collapsing chains so every shared layer points at an allocated layer.
-
-    A natively shared layer keeps its own target, but that target may itself
-    now alias the first layer. ``init_kv_cache`` aliases in dict order, so an
-    unresolved chain would read a cache entry that is not populated yet.
-    """
-    merged = {**native, **share_all}
-    resolved: dict[str, str] = {}
-    for layer_name in merged:
-        target = merged[layer_name]
-        seen = {layer_name}
-        while target in merged and target not in seen:
-            seen.add(target)
-            target = merged[target]
-        resolved[layer_name] = target
-    return resolved
+    """VLLM_SHARE_KV_ALL_LAYERS alias map for this model (empty when unset)."""
+    return share_kv_all_layers_map(_collect_kv_cache_spec(vllm_config))
 
 
 def get_shared_kv_cache_layers(vllm_config: VllmConfig):
@@ -222,7 +161,7 @@ def get_shared_kv_cache_layers(vllm_config: VllmConfig):
         if (kv_tgt_layer := attn_module.kv_sharing_target_layer_name)
     }
     if share_all := _share_kv_all_layers_map(vllm_config):
-        shared = _merge_share_all_layers(shared, share_all)
+        shared = resolve_kv_sharing_chains({**shared, **share_all})
     return shared
 
 
