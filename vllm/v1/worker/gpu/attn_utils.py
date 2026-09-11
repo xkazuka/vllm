@@ -1,15 +1,18 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
 from collections.abc import Mapping, Sequence
 from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, cast
 
 import numpy as np
+import regex as re
 import torch
 
 from vllm.config import VllmConfig, get_layers_from_vllm_config
 from vllm.config.compilation import CUDAGraphMode
+from vllm.logger import init_logger
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.multimodal.inputs import MultiModalFeatureSpec
@@ -39,6 +42,8 @@ if TYPE_CHECKING:
         BatchExecutionDescriptor,
         CudaGraphManager,
     )
+
+logger = init_logger(__name__)
 
 
 @dataclass(frozen=True)
@@ -119,7 +124,7 @@ class FastPrefillHelper:
         )
 
 
-def get_kv_cache_spec(vllm_config: VllmConfig) -> dict[str, KVCacheSpec]:
+def _collect_kv_cache_spec(vllm_config: VllmConfig) -> dict[str, KVCacheSpec]:
     kv_cache_spec: dict[str, KVCacheSpec] = {}
     layer_type = cast(type[Any], AttentionLayerBase)
     attn_layers = get_layers_from_vllm_config(vllm_config, layer_type)
@@ -135,13 +140,90 @@ def get_kv_cache_spec(vllm_config: VllmConfig) -> dict[str, KVCacheSpec]:
     return kv_cache_spec
 
 
+def get_kv_cache_spec(vllm_config: VllmConfig) -> dict[str, KVCacheSpec]:
+    kv_cache_spec = _collect_kv_cache_spec(vllm_config)
+    # Layers aliased by VLLM_SHARE_KV_ALL_LAYERS get no allocation of their own.
+    for layer_name in _share_kv_all_layers_map(vllm_config):
+        kv_cache_spec.pop(layer_name, None)
+    return kv_cache_spec
+
+
+def _share_kv_all_layers_map(vllm_config: VllmConfig) -> dict[str, str]:
+    """Layer-wise KV transfer simulation (VLLM_SHARE_KV_ALL_LAYERS=1).
+
+    TIMING EXPERIMENT ONLY. Maps every layer onto the lowest-indexed layer
+    with an identical spec, per cache family (e.g. MLA latent vs DSA indexer
+    k-cache). Only the target layers' caches are allocated, so KV capacity
+    scales ~x num_layers while each layer's attention reads/writes keep their
+    real volume and access pattern.
+
+    This simulates ideal (zero-cost-transfer) layer-wise KV swapping: the
+    upper bound for any KV-capacity scheme, measured with real per-layer
+    kernel timings. Outputs are garbage by design.
+    """
+    if os.environ.get("VLLM_SHARE_KV_ALL_LAYERS") != "1":
+        return {}
+
+    specs = _collect_kv_cache_spec(vllm_config)
+    if not specs:
+        return {}
+
+    def _family(name: str) -> str:
+        return re.sub(r"\.layers\.\d+\.", ".layers.*.", name)
+
+    def _layer_idx(name: str) -> int:
+        m = re.search(r"\.layers\.(\d+)\.", name)
+        return int(m.group(1)) if m else -1
+
+    family_target: dict[str, str] = {}
+    shared: dict[str, str] = {}
+    for name in sorted(specs, key=_layer_idx):
+        target = family_target.setdefault(_family(name), name)
+        if target != name:
+            assert specs[name] == specs[target], f"KV spec mismatch: {name} vs {target}"
+            shared[name] = target
+    logger.warning_once(
+        "VLLM_SHARE_KV_ALL_LAYERS=1: %d layers alias the KV caches of %s. "
+        "Outputs are garbage (timing experiment).",
+        len(shared),
+        # warning_once hashes its args to dedupe, so pass a str, not a list.
+        ", ".join(sorted(family_target.values())),
+    )
+    return shared
+
+
+def _merge_share_all_layers(
+    native: dict[str, str], share_all: dict[str, str]
+) -> dict[str, str]:
+    """Merge the VLLM_SHARE_KV_ALL_LAYERS map over a model's own KV sharing,
+    collapsing chains so every shared layer points at an allocated layer.
+
+    A natively shared layer keeps its own target, but that target may itself
+    now alias the first layer. ``init_kv_cache`` aliases in dict order, so an
+    unresolved chain would read a cache entry that is not populated yet.
+    """
+    merged = {**native, **share_all}
+    resolved: dict[str, str] = {}
+    for layer_name in merged:
+        target = merged[layer_name]
+        seen = {layer_name}
+        while target in merged and target not in seen:
+            seen.add(target)
+            target = merged[target]
+        resolved[layer_name] = target
+    return resolved
+
+
 def get_shared_kv_cache_layers(vllm_config: VllmConfig):
     attn_layers = get_layers_from_vllm_config(vllm_config, Attention)
-    return {
+    shared = {
         layer_name: kv_tgt_layer
         for layer_name, attn_module in attn_layers.items()
         if (kv_tgt_layer := attn_module.kv_sharing_target_layer_name)
     }
+    if share_all := _share_kv_all_layers_map(vllm_config):
+        shared = _merge_share_all_layers(shared, share_all)
+    return shared
 
 
 def get_kv_sharing_fast_prefill_eligible_layers(
@@ -186,8 +268,9 @@ def init_attn_backend(
 
     # Add KV-sharing layers to their target's kv cache group so they are
     # discovered alongside the target layer in Phase 1 below.
+    shared_kv_cache_layers = get_shared_kv_cache_layers(vllm_config)
     add_kv_sharing_layers_to_kv_cache_groups(
-        get_shared_kv_cache_layers(vllm_config), kv_cache_config.kv_cache_groups
+        shared_kv_cache_layers, kv_cache_config.kv_cache_groups
     )
     fast_prefill_eligible_layers = get_kv_sharing_fast_prefill_eligible_layers(
         vllm_config, draft_layer_names
@@ -216,7 +299,10 @@ def init_attn_backend(
 
             layer_kv_cache_spec: KVCacheSpec = kv_cache_group_spec.kv_cache_spec
             if isinstance(layer_kv_cache_spec, UniformTypeKVCacheSpecs):
-                layer_kv_cache_spec = layer_kv_cache_spec.kv_cache_specs[layer_name]
+                # Cross-layer KV sharing: a shared layer has no entry of its
+                # own; resolve to its target layer's spec.
+                spec_key = shared_kv_cache_layers.get(layer_name, layer_name)
+                layer_kv_cache_spec = layer_kv_cache_spec.kv_cache_specs[spec_key]
 
             # Split on per-rank num_heads_q so layers with different Q-head
             # counts (e.g. a spec-decode draft head and its target) get separate
