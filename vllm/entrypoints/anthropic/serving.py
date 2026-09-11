@@ -481,6 +481,8 @@ class AnthropicServingMessages(OpenAIServingChat):
             messages=openai_messages,
             max_tokens=anthropic_request.max_tokens,
             max_completion_tokens=anthropic_request.max_tokens,
+            min_tokens=anthropic_request.min_tokens,
+            ignore_eos=anthropic_request.ignore_eos,
             stop=anthropic_request.stop_sequences,
             temperature=anthropic_request.temperature,
             top_p=anthropic_request.top_p,

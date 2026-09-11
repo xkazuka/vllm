@@ -138,6 +138,22 @@ class AnthropicMessagesRequest(BaseModel):
     top_p: float | None = None
 
     # vLLM-specific fields that are not in Anthropic spec
+    min_tokens: int = Field(
+        default=0,
+        ge=0,
+        description=(
+            "Minimum number of tokens to generate before EOS may be emitted. "
+            "Pins output length for benchmarking, where a run must generate a "
+            "fixed token count regardless of what the model would sample."
+        ),
+    )
+    ignore_eos: bool = Field(
+        default=False,
+        description=(
+            "Ignore the EOS token and keep generating until max_tokens. Used "
+            "by benchmarks that need a deterministic output length."
+        ),
+    )
     cache_salt: str | None = Field(
         default=None,
         min_length=1,
